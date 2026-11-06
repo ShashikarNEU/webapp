@@ -4,6 +4,10 @@ on:
   pull_request:
     branches: [ "main" ]
 
+permissions:
+  contents: read
+  id-token: write # required for Workload Identity Federation
+
 jobs:
   build:
     name: Testing maven file
@@ -29,7 +33,9 @@ jobs:
       - name: GCP Credentials
         uses: 'google-github-actions/auth@v2'
         with:
-          credentials_json: '${{secrets.GCP_CREDENTIALS}}'
+          # Keyless: GitHub's OIDC token is exchanged for short-lived GCP creds
+          workload_identity_provider: '${{ secrets.WIF_PROVIDER }}'
+          service_account: '${{ secrets.WIF_SERVICE_ACCOUNT }}'
 
       - name: Build with Maven
         run: |

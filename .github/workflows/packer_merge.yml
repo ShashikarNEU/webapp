@@ -7,6 +7,10 @@ on:
     types:
       - closed
 
+permissions:
+  contents: read
+  id-token: write # required for Workload Identity Federation
+
 jobs:
   if_merged:
     if: github.event.pull_request.merged == true
@@ -58,7 +62,9 @@ jobs:
       - name: GCP Credentials
         uses: 'google-github-actions/auth@v2'
         with:
-          credentials_json: '${{secrets.GCP_CREDENTIALS}}'
+          # Keyless: GitHub's OIDC token is exchanged for short-lived GCP creds
+          workload_identity_provider: '${{ secrets.WIF_PROVIDER }}'
+          service_account: '${{ secrets.WIF_SERVICE_ACCOUNT }}'
 
       - name: Build with Maven
         run: |
@@ -89,54 +95,72 @@ jobs:
       - id: 'secrets'
         uses: 'google-github-actions/get-secretmanager-secrets@v2'
         with:
-         secrets: |-
-           db_name:projects/882091279014/secrets/db_name
-           db_ip:projects/882091279014/secrets/db_ip
-           db_password:projects/882091279014/secrets/db_password
-           db_username:projects/882091279014/secrets/db_username
-           vm-kms-encryption:projects/882091279014/secrets/vm-kms-encryption
+          # Only the disk encryption key path is needed here. DB credentials are
+          # read by each VM at boot (deploy/startup.sh), never put in metadata.
+          secrets: |-
+            vm-kms-encryption:projects/${{ secrets.project_id }}/secrets/vm-kms-encryption
 
       - name: 'Set up Cloud SDK'
         uses: 'google-github-actions/setup-gcloud@v2'
 
-      - name: 'Use gcloud CLI'
+      - name: 'Create instance template from the new image'
+        env:
+          PROJECT_ID: ${{ secrets.project_id }}
+          VM_KMS_KEY: ${{ steps.secrets.outputs.vm-kms-encryption }}
         run: |
-          gcloud compute instance-templates create $INSTANCE_TEMPLATE-$RANDOM_STRING \
-            --machine-type=$MACHINE_TYPE \
-            --instance-template-region=$REGION \
-            --create-disk=image=projects/csye6225-dev-414805/global/images/$VM_IMAGE_NAME,size=$VM_DISK_SIZE,type=$VM_DISK_TYPE,auto-delete=yes,boot=true \
-            --network=$GCLOUD_NETWORK \
-            --subnet=$SUBNET \
-            --metadata=startup-script="echo 'DATABASE_URL=jdbc:mysql://${{steps.secrets.outputs.db_ip}}:3306/${{steps.secrets.outputs.db_name}}?createDatabaseIfNotExist=true' > .env && \
-            echo 'DATABASE_USERNAME=${{steps.secrets.outputs.db_username}}' >> .env && \
-            echo 'DATABASE_PASSWORD=${{steps.secrets.outputs.db_password}}' >> .env && \
-            sudo mv .env /opt/ && \
-            sudo chown csye6225:csye6225 /opt/.env && \
-            sudo setenforce 0 && \
-            sudo systemctl daemon-reload && \
-            sudo systemctl restart csye6225.service" \
-            --service-account=$VM_INSTANCE_SERVICE_ACCOUNT \
+          # --no-address: VMs get no public IP (ingress only via the LB, egress via Cloud NAT)
+          # kms-key: keep boot disks on the customer-managed key, same as the Terraform template
+          # cloud-platform scope: lets the VM's service account read Secret Manager at boot
+          gcloud compute instance-templates create "$INSTANCE_TEMPLATE-$RANDOM_STRING" \
+            --project="$PROJECT_ID" \
+            --machine-type="$MACHINE_TYPE" \
+            --instance-template-region="$REGION" \
+            --create-disk="image=projects/$PROJECT_ID/global/images/$VM_IMAGE_NAME,size=$VM_DISK_SIZE,type=$VM_DISK_TYPE,auto-delete=yes,boot=true,kms-key=$VM_KMS_KEY" \
+            --network="$GCLOUD_NETWORK" \
+            --subnet="$SUBNET" \
+            --no-address \
+            --metadata-from-file=startup-script=deploy/startup.sh \
+            --service-account="$VM_INSTANCE_SERVICE_ACCOUNT" \
+            --scopes=cloud-platform \
             --tags=web
 
-
-      - name: 'Link the managed instance group to use the new instance template'
-        run: | 
-          gcloud compute instance-groups managed set-instance-template \
-          $INSTANCE_GRP_MANAGER \
-          --template=projects/csye6225-dev-414805/regions/us-east1/instanceTemplates/$INSTANCE_TEMPLATE-$RANDOM_STRING
-
-      - name: 'Start Rolling Update to update the grp manager to use the new instance template'
+      - name: 'Point the managed instance group at the new template'
+        env:
+          PROJECT_ID: ${{ secrets.project_id }}
         run: |
-          gcloud compute instance-groups managed rolling-action start-update $INSTANCE_GRP_MANAGER \
-          --max-unavailable=3 \
-          --type=$ROLLING_ACTION_TYPE \
-          --version=template=projects/csye6225-dev-414805/regions/us-east1/instanceTemplates/$INSTANCE_TEMPLATE-$RANDOM_STRING
+          gcloud compute instance-groups managed set-instance-template "$INSTANCE_GRP_MANAGER" \
+            --project="$PROJECT_ID" \
+            --region="$REGION" \
+            --template="projects/$PROJECT_ID/regions/$REGION/instanceTemplates/$INSTANCE_TEMPLATE-$RANDOM_STRING"
 
-      - name: 'Check if the rolling updates are done by checking version target reached flag'
+      - name: 'Rolling update with no capacity loss'
+        env:
+          PROJECT_ID: ${{ secrets.project_id }}
         run: |
-          gcloud compute instance-groups managed wait-until $INSTANCE_GRP_MANAGER \
-          --version-target-reached \
+          # Surge new VMs first and never take an old one down before its
+          # replacement is healthy (previously --max-unavailable=3).
+          gcloud compute instance-groups managed rolling-action start-update "$INSTANCE_GRP_MANAGER" \
+            --project="$PROJECT_ID" \
+            --region="$REGION" \
+            --max-surge=3 \
+            --max-unavailable=0 \
+            --type="$ROLLING_ACTION_TYPE" \
+            --version="template=projects/$PROJECT_ID/regions/$REGION/instanceTemplates/$INSTANCE_TEMPLATE-$RANDOM_STRING"
 
-      - name: 'Describing the instance grp manager status'
+      - name: 'Wait until every VM runs the new template'
+        env:
+          PROJECT_ID: ${{ secrets.project_id }}
         run: |
-          gcloud compute instance-groups managed describe $INSTANCE_GRP_MANAGER \
+          gcloud compute instance-groups managed wait-until "$INSTANCE_GRP_MANAGER" \
+            --project="$PROJECT_ID" \
+            --region="$REGION" \
+            --version-target-reached \
+            --timeout=1200
+
+      - name: 'Describe the instance group status'
+        env:
+          PROJECT_ID: ${{ secrets.project_id }}
+        run: |
+          gcloud compute instance-groups managed describe "$INSTANCE_GRP_MANAGER" \
+            --project="$PROJECT_ID" \
+            --region="$REGION"
