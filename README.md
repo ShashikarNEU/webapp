@@ -15,7 +15,7 @@ A **Spring Boot 3** REST API for user accounts (sign-up, email verification, pro
 | Logging | Log4j2 JSON logs, shipped by the Google Ops Agent to Cloud Logging |
 | Image | Packer (`googlecompute`), CentOS, app runs as a `nologin` system user under systemd |
 | Infra | Terraform ([tf-gcp-infra](https://github.com/ShashikarNEU/tf-gcp-infra)) |
-| CI/CD | GitHub Actions with Workload Identity Federation (no stored keys) |
+| CI/CD | GitHub Actions |
 
 ---
 
@@ -103,7 +103,7 @@ At boot, `deploy/startup.sh` reads the DB settings from **Secret Manager** using
 
 | Secret | Purpose |
 |--------|---------|
-| `WIF_PROVIDER`, `WIF_SERVICE_ACCOUNT` | Keyless auth to GCP (from `terraform output workload_identity_provider` in tf-gcp-infra) |
+| `GCP_CREDENTIALS` | Service-account key used by the GCP auth steps |
 | `project_id`, `REGION`, `GCLOUD_NETWORK`, `SUBNET` | Where templates are created |
 | `INSTANCE_GRP_MANAGER`, `INSTANCE_TEMPLATE`, `ROLLING_ACTION_TYPE` | Which MIG to roll and how |
 | `MACHINE_TYPE`, `VM_DISK_SIZE`, `VM_DISK_TYPE`, `VM_INSTANCE_SERVICE_ACCOUNT` | Template settings |
@@ -147,5 +147,5 @@ webapp/
 
 ## Related repositories
 
-- [tf-gcp-infra](https://github.com/ShashikarNEU/tf-gcp-infra): VPC, MIG, load balancer, Cloud SQL, KMS, Secret Manager, WIF, alerts
+- [tf-gcp-infra](https://github.com/ShashikarNEU/tf-gcp-infra): VPC, MIG, load balancer, Cloud SQL, KMS, Secret Manager, alerts
 - [serverless-fork](https://github.com/ShashikarNEU/serverless-fork): Pub/Sub-triggered Cloud Function that sends verification emails
