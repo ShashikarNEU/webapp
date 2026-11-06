@@ -1,6 +1,6 @@
-# Web App — Cloud-Native User Management API
+# Web App: Cloud-Native User Management API
 
-A production-grade **RESTful API** for managing user accounts, built with **Spring Boot** and deployed on **Google Cloud Platform**. Features secure token-based authentication, automated CI/CD with GitHub Actions, and cloud-native integrations including Pub/Sub messaging and email verification.
+A **Spring Boot 3** REST API for user accounts (sign-up, email verification, profile read/update), deployed on **Google Cloud** as an immutable VM image behind a global HTTPS load balancer. Infrastructure is in [tf-gcp-infra](https://github.com/ShashikarNEU/tf-gcp-infra). The email verification function is in [serverless-fork](https://github.com/ShashikarNEU/serverless-fork).
 
 ---
 
@@ -8,152 +8,144 @@ A production-grade **RESTful API** for managing user accounts, built with **Spri
 
 | Layer | Technology |
 |---|---|
-| Backend | Java 17, Spring Boot 3.2.2 |
-| Database | MySQL (Cloud SQL on GCP) |
-| Authentication | HTTP Basic Auth with BCrypt password hashing |
-| Cloud | Google Cloud Platform (Compute Engine, Cloud SQL, Pub/Sub, Cloud Storage) |
-| Infrastructure | Terraform (via [tf-gcp-infra](https://github.com/ShashikarNEU/tf-gcp-infra)) |
-| CI/CD | GitHub Actions |
-| Build | Maven |
+| Backend | Java 17, Spring Boot 3.2, Spring Data JPA (Hibernate), Lombok |
+| Database | MySQL (Cloud SQL, private IP) |
+| Auth | HTTP Basic Auth, passwords hashed with BCrypt |
+| Messaging | Google Cloud Pub/Sub (publishes verification events) |
+| Logging | Log4j2 JSON logs, shipped by the Google Ops Agent to Cloud Logging |
+| Image | Packer (`googlecompute`), CentOS, app runs as a `nologin` system user under systemd |
+| Infra | Terraform ([tf-gcp-infra](https://github.com/ShashikarNEU/tf-gcp-infra)) |
+| CI/CD | GitHub Actions with Workload Identity Federation (no stored keys) |
 
 ---
 
-## Features
+## API
 
-- **User Registration** — Create accounts with email, password, first/last name
-- **Secure Authentication** — HTTP Basic Auth with BCrypt hashing (no plaintext passwords ever stored)
-- **Profile Management** — Retrieve and update user information
-- **Email Verification** — New users receive a verification email via GCP Pub/Sub + Cloud Functions
-- **Token-Based Access Control** — Authenticated endpoints require valid credentials
-- **CI/CD Pipeline** — GitHub Actions compiles, tests, and validates every pull request
-- **Branch Protection** — PRs can only merge if GitHub Actions workflow passes
-- **Cloud Deployment** — Runs on GCP Compute Engine with auto-scaling and load balancing
+| Method | Endpoint | Auth | Description |
+|--------|----------|------|-------------|
+| POST | `/v1/user` | No | Create a user. Publishes a verification event to Pub/Sub |
+| GET | `/v1/user/verify?token=<uuid>:<email>` | No | Verify the email (link expires 2 minutes after it's sent) |
+| GET | `/v1/user/self` | Basic | Get your profile (verified users only) |
+| PUT | `/v1/user/self` | Basic | Update first name, last name or password (verified users only) |
+| GET | `/healthz` | No | 200 if the database is reachable, 503 if not. Used by the LB and auto-healing |
 
----
+`HEAD` and `OPTIONS` on these paths return `405`. Unknown JSON fields are rejected with `400`.
 
-## API Endpoints
-
-### User Management
-
-| Method | Endpoint | Auth Required | Description |
-|--------|----------|---------------|-------------|
-| POST | `/v1/user` | No | Create a new user account |
-| GET | `/v1/user/self` | Yes | Get current user's profile |
-| PUT | `/v1/user/self` | Yes | Update current user's profile |
-
-### Health Check
-
-| Method | Endpoint | Description |
-|--------|----------|-------------|
-| GET | `/healthz` | Application health check |
-
----
-
-## Request & Response Examples
-
-### Create a User
+### Create a user
 
 ```bash
-curl -X POST http://localhost:8080/v1/user \
+curl -X POST https://<your-domain>/v1/user \
   -H "Content-Type: application/json" \
   -d '{
-    "email": "user@example.com",
+    "username": "user@example.com",
     "password": "securePassword123",
     "first_name": "John",
     "last_name": "Doe"
   }'
 ```
 
-**Response** `201 Created`:
+`201 Created`:
+
 ```json
 {
   "id": "uuid",
-  "email": "user@example.com",
   "first_name": "John",
   "last_name": "Doe",
-  "account_created": "2024-01-01T00:00:00Z",
-  "account_updated": "2024-01-01T00:00:00Z"
+  "username": "user@example.com",
+  "account_created": "...",
+  "account_updated": "..."
 }
 ```
 
-### Get User Profile
+### Get your profile
 
 ```bash
-curl -X GET http://localhost:8080/v1/user/self \
-  -u "user@example.com:securePassword123"
+curl https://<your-domain>/v1/user/self -u "user@example.com:securePassword123"
 ```
 
 ---
 
-## Local Development Setup
+## Sign-up and verification flow
 
-### Prerequisites
+```
+POST /v1/user
+  -> validate, BCrypt-hash password, save to Cloud SQL
+  -> generate UUID token, publish "<uuid>:<email>" to Pub/Sub topic verify-email
+       -> Cloud Function sends the link via Mailgun and sets email_expiry_time = now + 2 min
+GET /v1/user/verify?token=...
+  -> token matches and not expired -> user marked verified
+Authenticated endpoints reject unverified users.
+```
 
-- Java 17+
-- Maven 3.6+
-- MySQL 8.0+
+---
 
-### 1. Clone the Repository
+## Deployment
+
+```
+PR to main
+  ├─ maven-compile.yml   mvn compile
+  ├─ maven-test.yml      integration tests against MySQL on the runner
+  └─ packer_pr.yml       build JAR, packer fmt -check + validate
+
+Merge to main (packer_merge.yml)
+  1. Build the JAR, bake a new image with Packer
+     (Java 17, JAR, systemd unit, Ops Agent, csye6225 nologin user)
+  2. Create a new regional instance template from that image:
+     no external IP, CMEK boot disk, cloud-platform scope, boot script deploy/startup.sh
+  3. Point the managed instance group at it and start a rolling update
+     (max-surge 3, max-unavailable 0, so capacity never drops)
+  4. Wait until every VM runs the new version
+```
+
+At boot, `deploy/startup.sh` reads the DB settings from **Secret Manager** using the VM's service account and writes `/opt/.env` (mode 600). No credentials are stored in instance metadata.
+
+### GitHub secrets used
+
+| Secret | Purpose |
+|--------|---------|
+| `WIF_PROVIDER`, `WIF_SERVICE_ACCOUNT` | Keyless auth to GCP (from `terraform output workload_identity_provider` in tf-gcp-infra) |
+| `project_id`, `REGION`, `GCLOUD_NETWORK`, `SUBNET` | Where templates are created |
+| `INSTANCE_GRP_MANAGER`, `INSTANCE_TEMPLATE`, `ROLLING_ACTION_TYPE` | Which MIG to roll and how |
+| `MACHINE_TYPE`, `VM_DISK_SIZE`, `VM_DISK_TYPE`, `VM_INSTANCE_SERVICE_ACCOUNT` | Template settings |
+| `PKR_VAR_*` values (`source_image`, `zone`, `ssh_username`, ...) | Packer build settings |
+| `DATABASE_URL`, `DATABASE_USERNAME`, `DATABASE_PASSWORD` | MySQL on the CI runner for tests |
+
+---
+
+## Local development
+
+Prerequisites: Java 17, Maven 3.6+, MySQL 8.
+
+The app reads its datasource from environment variables (or a `.env` file in the working directory):
 
 ```bash
-git clone https://github.com/ShashikarNEU/webapp.git
-cd webapp
+export DATABASE_URL="jdbc:mysql://localhost:3306/cloudDatabase?createDatabaseIfNotExist=true"
+export DATABASE_USERNAME=root
+export DATABASE_PASSWORD=<password>
+
+./mvnw spring-boot:run      # http://localhost:8080
+./mvnw test
 ```
 
-### 2. Configure the Database
-
-Update `src/main/resources/application.properties`:
-
-```properties
-spring.datasource.url=jdbc:mysql://localhost:3306/userdb
-spring.datasource.username=your_username
-spring.datasource.password=your_password
-spring.jpa.hibernate.ddl-auto=update
-```
-
-### 3. Build and Run
-
-```bash
-# Build
-./mvnw clean install
-
-# Run
-./mvnw spring-boot:run
-```
-
-App runs at `http://localhost:8080`.
+Sign-up publishes to Pub/Sub, so creating users locally needs Google credentials (`gcloud auth application-default login`) with access to the topic.
 
 ---
 
-## CI/CD Pipeline
-
-GitHub Actions workflow on every pull request:
-
-1. Checks out the code
-2. Sets up Java 17
-3. Runs `mvn compile` to validate the build
-4. PR can only be merged if the workflow passes (branch protection enforced)
-
----
-
-## Cloud Architecture
+## Repository layout
 
 ```
-Internet → Load Balancer → Compute Engine (Auto-scaling MIG)
-                                  ↓
-                           Spring Boot App
-                                  ↓
-                    ┌─────────────┴──────────────┐
-                    ↓                            ↓
-               Cloud SQL (MySQL)          GCP Pub/Sub
-                                               ↓
-                                      Cloud Functions
-                                      (Email Verification)
+webapp/
+├── src/main/java/com/csye6225/webapp/   controllers, services, JPA entity, exception handlers
+├── src/main/resources/                  application.properties, log4j2-spring.xml (JSON logs)
+├── src/test/                            integration tests
+├── packer/                              image template, systemd unit, provisioning scripts
+├── deploy/startup.sh                    VM boot script (reads Secret Manager)
+└── .github/workflows/                   CI and deploy pipelines
 ```
 
 ---
 
-## Related Repositories
+## Related repositories
 
-- [tf-gcp-infra](https://github.com/ShashikarNEU/tf-gcp-infra) — Terraform infrastructure for this app
-- [serverless-fork](https://github.com/ShashikarNEU/serverless-fork) — Cloud Functions for email verification
+- [tf-gcp-infra](https://github.com/ShashikarNEU/tf-gcp-infra): VPC, MIG, load balancer, Cloud SQL, KMS, Secret Manager, WIF, alerts
+- [serverless-fork](https://github.com/ShashikarNEU/serverless-fork): Pub/Sub-triggered Cloud Function that sends verification emails
